@@ -530,7 +530,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
+                // A GQA ratio without a power-of-2 factor (e.g. 7) leaves the tile kernel one query per block: the
+                // vector kernel is then 2x faster on a GTX 1050 Ti (14 vs 30 us, 14 heads, 2 KV heads, D 64, 512 KV).
+                if (!gqa_opt_applies || (GGML_CUDA_CC_IS_NVIDIA(cc) && gqa_ratio_eff == 1)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
