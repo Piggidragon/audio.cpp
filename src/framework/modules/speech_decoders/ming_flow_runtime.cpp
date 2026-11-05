@@ -122,10 +122,11 @@ private:
         linear.in = in;
         for (const auto & part : parts) linear.out += part.second;
         const size_t blocks = static_cast<size_t>(in / 32);
-        const size_t row_bytes = static_cast<size_t>(in + in / 16);
+        const size_t row_bytes = static_cast<size_t>(GGML_PAD(in + in / 16, 16));
         std::vector<std::byte> packed;
         std::vector<float> bias;
-        bool q8 = in % 32 == 0;
+        // GGML_OP_MUL_MAT_Q8S is a CUDA op; other backends use the regular matmul.
+        bool q8 = in % 32 == 0 && execution_.backend_type() == core::BackendType::Cuda;
         for (const auto & [prefix, rows] : parts) {
             if (!q8) break;
             const auto raw = source.require_tensor_data(prefix + ".weight");
