@@ -15,6 +15,8 @@ struct LinearConfig {
     bool cuda_nvfp4_f16_activation_lowering = false;
     bool vulkan_f32_activation_lowering = false;
     bool cuda_f16_output = false;
+    // Round the output to bf16 (ggml_round_bf16), inside GGML_OP_MUL_MAT_Q8S for repacked Q8_0 weights.
+    bool round_bf16_output = false;
 };
 
 struct LinearWeights {

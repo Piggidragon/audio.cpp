@@ -3628,9 +3628,8 @@ struct ggml_tensor * ggml_mul_mat_q8s(
         bool                  round_bf16) {
     GGML_ASSERT(w->type == GGML_TYPE_I8 && ggml_is_contiguous(w));
     GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
-    const int64_t k = w->ne[0] * 16 / 17;
-    GGML_ASSERT(k % 32 == 0 && k + k / 16 == w->ne[0] && w->ne[0] % 16 == 0);
-    GGML_ASSERT(x->ne[0] == k);
+    const int64_t k = x->ne[0];
+    GGML_ASSERT(k % 32 == 0 && w->ne[0] == GGML_PAD(k + k / 16, 16));
     GGML_ASSERT(bias == NULL || (bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == w->ne[1]));
 
     const int64_t ne[4] = { w->ne[1], x->ne[1], x->ne[2], x->ne[3] };

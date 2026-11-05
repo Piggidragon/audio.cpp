@@ -1621,7 +1621,7 @@ extern "C" {
 
     // dst = w x (+ bias), optionally rounded to bf16; meant for few columns of x (decode-sized batches).
     // w is an I8 tensor [row_bytes, rows]: each row holds k int8 quants and then k/32 fp16 scales
-    // (Q8_0 with the scales split off), with row_bytes = k + k/16 a multiple of 16.
+    // (Q8_0 with the scales split off), padded to row_bytes = k + k/16 rounded up to a multiple of 16.
     GGML_API struct ggml_tensor * ggml_mul_mat_q8s(
             struct ggml_context * ctx,
             struct ggml_tensor  * w,

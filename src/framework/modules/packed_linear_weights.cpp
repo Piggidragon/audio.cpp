@@ -1,5 +1,6 @@
 #include "engine/framework/modules/packed_linear_weights.h"
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -92,11 +93,31 @@ LinearWeights PackedLinearWeightsBuilder::build(
     }
 
     LinearWeights weights;
-    weights.weight = store.make_tensor(
-        core::TensorShape::from_dims({out_features, in_features}),
-        packed_type,
-        packed_weight.data(),
-        packed_weight.size());
+    if (config_.repack_q8s && packed_type == GGML_TYPE_Q8_0 && in_features % 32 == 0) {
+        // Q8_0 blocks are an fp16 scale and 32 int8 quants; split them into the quants and then the scales of a row.
+        const size_t blocks = static_cast<size_t>(in_features / 32);
+        const size_t q8s_row_bytes = static_cast<size_t>(GGML_PAD(in_features + in_features / 16, 16));
+        std::vector<std::byte> repacked(static_cast<size_t>(out_features) * q8s_row_bytes);
+        for (size_t row = 0; row < static_cast<size_t>(out_features); ++row) {
+            std::byte * out = repacked.data() + row * q8s_row_bytes;
+            for (size_t block = 0; block < blocks; ++block) {
+                const std::byte * in = packed_weight.data() + (row * blocks + block) * 34;
+                std::memcpy(out + block * 32, in + 2, 32);
+                std::memcpy(out + in_features + block * 2, in, 2);
+            }
+        }
+        weights.weight = store.make_tensor(
+            core::TensorShape::from_dims({out_features, static_cast<int64_t>(q8s_row_bytes)}),
+            GGML_TYPE_I8,
+            repacked.data(),
+            repacked.size());
+    } else {
+        weights.weight = store.make_tensor(
+            core::TensorShape::from_dims({out_features, in_features}),
+            packed_type,
+            packed_weight.data(),
+            packed_weight.size());
+    }
     if (config_.use_bias) {
         weights.bias = store.make_tensor(
             core::TensorShape::from_dims({out_features}),

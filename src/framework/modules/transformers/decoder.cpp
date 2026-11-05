@@ -289,10 +289,26 @@ core::TensorValue activation_cast(
     return core::wrap_tensor(ggml_cast(ctx.ggml, rounded.tensor, GGML_TYPE_F32), input.shape, GGML_TYPE_F32);
 }
 
+// The fused bf16 round after a projection whose Q8_0 weights are repacked for GGML_OP_MUL_MAT_Q8S is done by that
+// op (round_bf16_output): the same values without a separate kernel, and the caller skips the activation cast.
+// An output that is split into slices is only rounded by the op for a single row: the slices of several rows are
+// strided, and rounding them separately is what makes them contiguous for the ops after.
+bool projection_rounds(const DecoderActivationCastPolicy & policy, bool cast_after, const core::TensorValue & weight) {
+    return policy.enabled && cast_after && policy.fused_round && policy.type == GGML_TYPE_BF16 &&
+        weight.type == GGML_TYPE_I8;
+}
+
+LinearConfig projection_config(int64_t in, int64_t out, bool use_bias, ggml_prec precision, bool round_bf16_output) {
+    LinearConfig config{in, out, use_bias, precision};
+    config.round_bf16_output = round_bf16_output;
+    return config;
+}
+
 struct QKVProjections {
     core::TensorValue q;
     core::TensorValue k;
     core::TensorValue v;
+    bool rounded = false;  // projection_rounds: the activation cast after the projection is done
 };
 
 bool flash_branches_allowed(const DecoderLayerConfig & config) {
@@ -311,18 +327,16 @@ QKVProjections build_qkv_projections(
         if (!weights.self_attention.qkv_weight.has_value()) {
             throw std::runtime_error("Qwen packed QKV layout requires self_attention.qkv_weight");
         }
-        auto qkv = LinearModule(
-                       {
-                           config.hidden_size,
-                           q_out + kv_out * 2,
-                           weights.self_attention.qkv_bias.has_value(),
-                           config.projection_precision,
-                       })
+        const bool rounded = projection_rounds(config.activation_cast, config.activation_cast.after_qkv_projection,
+            *weights.self_attention.qkv_weight) && input.shape.prefix_elements() == 1;
+        auto qkv = LinearModule(projection_config(config.hidden_size, q_out + kv_out * 2,
+                       weights.self_attention.qkv_bias.has_value(), config.projection_precision, rounded))
                        .build(ctx, input, {*weights.self_attention.qkv_weight, weights.self_attention.qkv_bias});
         return {
             SliceModule({2, 0, q_out}).build(ctx, qkv),
             SliceModule({2, q_out, kv_out}).build(ctx, qkv),
             SliceModule({2, q_out + kv_out, kv_out}).build(ctx, qkv),
+            rounded,
         };
     }
     auto q = LinearModule(
@@ -436,18 +450,16 @@ core::TensorValue build_mlp(
     core::TensorValue gate;
     core::TensorValue up;
     std::optional<core::TensorValue> packed_gate_up;
+    bool gate_up_rounded = false;
     const auto mlp_mode = config.runtime.mlp.mode;
     if (mlp_mode == DecoderMLPMode::PackedGateUp) {
         if (!weights.gate_up_proj.has_value()) {
             throw std::runtime_error("QwenMLPWeights.gate_up_proj is required for packed gate/up mode");
         }
-        auto gate_up = LinearModule(
-                           {
-                               config.hidden_size,
-                               config.intermediate_size * 2,
-                               weights.gate_up_proj->bias.has_value(),
-                               config.projection_precision,
-                           })
+        gate_up_rounded = projection_rounds(config.activation_cast, config.activation_cast.after_mlp_projection,
+            weights.gate_up_proj->weight) && input.shape.prefix_elements() == 1;
+        auto gate_up = LinearModule(projection_config(config.hidden_size, config.intermediate_size * 2,
+                           weights.gate_up_proj->bias.has_value(), config.projection_precision, gate_up_rounded))
                            .build(
                                ctx,
                                input,
@@ -494,7 +506,7 @@ core::TensorValue build_mlp(
             gate.shape,
             gate.type);
     } else {
-        if (config.activation_cast.enabled && config.activation_cast.after_mlp_projection) {
+        if (config.activation_cast.enabled && config.activation_cast.after_mlp_projection && !gate_up_rounded) {
             gate = activation_cast(ctx, gate, config.activation_cast);
             up = activation_cast(ctx, up, config.activation_cast);
         }
@@ -507,15 +519,12 @@ core::TensorValue build_mlp(
             gated = activation_cast(ctx, gated, config.activation_cast);
         }
     }
-    auto down = LinearModule(
-                    {
-                        config.intermediate_size,
-                        config.hidden_size,
-                        weights.down_proj.bias.has_value(),
-                        config.projection_precision,
-                    })
+    const bool down_rounded = projection_rounds(config.activation_cast, config.activation_cast.after_mlp_projection,
+        weights.down_proj.weight);
+    auto down = LinearModule(projection_config(config.intermediate_size, config.hidden_size,
+                    weights.down_proj.bias.has_value(), config.projection_precision, down_rounded))
                     .build(ctx, gated, require_linear(weights.down_proj, false, "QwenMLPWeights.down_proj"));
-    if (config.activation_cast.enabled && config.activation_cast.after_mlp_projection) {
+    if (config.activation_cast.enabled && config.activation_cast.after_mlp_projection && !down_rounded) {
         down = activation_cast(ctx, down, config.activation_cast);
     }
     return down;
@@ -556,7 +565,7 @@ DecoderLayerOutputs DecoderLayerModule::build(
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !qkv.rounded) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -683,18 +692,15 @@ DecoderLayerOutputs DecoderLayerModule::build(
         context,
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], config_.num_attention_heads * dim}));
 
-    auto attn_out = LinearModule(
-                        {
-                            config_.num_attention_heads * dim,
-                            config_.hidden_size,
-                            weights.self_attention.out_bias.has_value(),
-                            config_.projection_precision,
-                        })
+    const bool out_rounded = projection_rounds(config_.activation_cast, config_.activation_cast.after_attention_output,
+        weights.self_attention.out_weight);
+    auto attn_out = LinearModule(projection_config(config_.num_attention_heads * dim, config_.hidden_size,
+                        weights.self_attention.out_bias.has_value(), config_.projection_precision, out_rounded))
                         .build(
                             ctx,
                             context,
                             {weights.self_attention.out_weight, weights.self_attention.out_bias});
-    if (config_.activation_cast.enabled && config_.activation_cast.after_attention_output) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_attention_output && !out_rounded) {
         attn_out = activation_cast(ctx, attn_out, config_.activation_cast);
     }
     auto x = AddModule{}.build(ctx, input, attn_out);
@@ -770,7 +776,7 @@ DecoderLayerOutputs DecoderLayerModule::build_static_cache_impl(
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !qkv.rounded) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -894,18 +900,15 @@ DecoderLayerOutputs DecoderLayerModule::build_static_cache_impl(
         context,
         core::TensorShape::from_dims({1, block ? input.shape.dims[1] : 1, config_.num_attention_heads * dim}));
 
-    auto attn_out = LinearModule(
-                        {
-                            config_.num_attention_heads * dim,
-                            config_.hidden_size,
-                            weights.self_attention.out_bias.has_value(),
-                            config_.projection_precision,
-                        })
+    const bool out_rounded = projection_rounds(config_.activation_cast, config_.activation_cast.after_attention_output,
+        weights.self_attention.out_weight);
+    auto attn_out = LinearModule(projection_config(config_.num_attention_heads * dim, config_.hidden_size,
+                        weights.self_attention.out_bias.has_value(), config_.projection_precision, out_rounded))
                         .build(
                             ctx,
                             context,
                             {weights.self_attention.out_weight, weights.self_attention.out_bias});
-    if (config_.activation_cast.enabled && config_.activation_cast.after_attention_output) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_attention_output && !out_rounded) {
         attn_out = activation_cast(ctx, attn_out, config_.activation_cast);
     }
     auto x = AddModule{}.build(ctx, input, attn_out);
@@ -955,7 +958,7 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !qkv.rounded) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -1062,18 +1065,15 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
         context,
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], config_.num_attention_heads * dim}));
 
-    auto attn_out = LinearModule(
-                        {
-                            config_.num_attention_heads * dim,
-                            config_.hidden_size,
-                            weights.self_attention.out_bias.has_value(),
-                            config_.projection_precision,
-                        })
+    const bool out_rounded = projection_rounds(config_.activation_cast, config_.activation_cast.after_attention_output,
+        weights.self_attention.out_weight);
+    auto attn_out = LinearModule(projection_config(config_.num_attention_heads * dim, config_.hidden_size,
+                        weights.self_attention.out_bias.has_value(), config_.projection_precision, out_rounded))
                         .build(
                             ctx,
                             context,
                             {weights.self_attention.out_weight, weights.self_attention.out_bias});
-    if (config_.activation_cast.enabled && config_.activation_cast.after_attention_output) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_attention_output && !out_rounded) {
         attn_out = activation_cast(ctx, attn_out, config_.activation_cast);
     }
     auto x = AddModule{}.build(ctx, input, attn_out);

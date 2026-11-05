@@ -86,6 +86,9 @@ struct MingGenerator::Impl {
         core::round_f32_to_bf16_in_place(rounded);
         for (size_t i = 0; i < frequencies.size(); ++i) frequencies[i] /= rounded[i];
         const auto factors = store_.make_f32(core::TensorShape::from_dims({c.head_dim / 2}), frequencies);
+        // On CUDA the Q8_0 projections use GGML_OP_MUL_MAT_Q8S: its 16-byte loads stream a decode step's weights
+        // faster than MMVQ's 2-byte ones.
+        const bool q8s = execution.backend_type() == core::BackendType::Cuda;
         for (int64_t i = 0; i < c.layers; ++i) {
             const auto p = "model.model.layers." + std::to_string(i);
             modules::DecoderLayerWeights layer;
@@ -94,17 +97,20 @@ struct MingGenerator::Impl {
             const auto qkv = modules::PackedLinearWeightsBuilder({c.hidden_size, {
                 {p + ".self_attn.q_proj.weight", p + ".self_attn.q_proj.bias", c.hidden_size},
                 {p + ".self_attn.k_proj.weight", p + ".self_attn.k_proj.bias", c.num_key_value_heads * c.head_dim},
-                {p + ".self_attn.v_proj.weight", p + ".self_attn.v_proj.bias", c.num_key_value_heads * c.head_dim}}, true})
-                .build(store_, *source, storage);
+                {p + ".self_attn.v_proj.weight", p + ".self_attn.v_proj.bias", c.num_key_value_heads * c.head_dim}}, true,
+                false, q8s}).build(store_, *source, storage);
             layer.self_attention.qkv_weight = qkv.weight;
             layer.self_attention.qkv_bias = qkv.bias;
-            layer.self_attention.out_weight = store_.load_tensor(*source, p + ".self_attn.o_proj.weight", storage,
-                {c.hidden_size, c.hidden_size});
+            layer.self_attention.out_weight = modules::PackedLinearWeightsBuilder({c.hidden_size, {
+                {p + ".self_attn.o_proj.weight", std::nullopt, c.hidden_size}}, false, false, q8s})
+                .build(store_, *source, storage).weight;
             layer.mlp.gate_up_proj = modules::PackedLinearWeightsBuilder({c.hidden_size, {
                 {p + ".mlp.gate_proj.weight", std::nullopt, c.intermediate_size},
-                {p + ".mlp.up_proj.weight", std::nullopt, c.intermediate_size}}, false}).build(store_, *source, storage);
-            layer.mlp.down_proj = binding::linear_from_source(store_, *source, p + ".mlp.down_proj", storage,
-                c.hidden_size, c.intermediate_size, false);
+                {p + ".mlp.up_proj.weight", std::nullopt, c.intermediate_size}}, false, false, q8s})
+                .build(store_, *source, storage);
+            layer.mlp.down_proj = modules::PackedLinearWeightsBuilder({c.intermediate_size, {
+                {p + ".mlp.down_proj.weight", std::nullopt, c.hidden_size}}, false, false, q8s})
+                .build(store_, *source, storage);
             layer.rope_frequency_factors = factors;
             weights.stack.layers.push_back(std::move(layer));
         }

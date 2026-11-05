@@ -34,10 +34,18 @@ core::TensorShape flatten_to_matrix_shape(const core::TensorShape & shape) {
     return core::TensorShape::from_dims({shape.prefix_elements(), shape.last_dim()});
 }
 
+// Q8_0 weights repacked for GGML_OP_MUL_MAT_Q8S (PackedLinearWeightsConfig::repack_q8s): I8 rows of in_features
+// quants followed by in_features / 32 fp16 scales, padded to 16 bytes.
+bool is_q8s_weight(const LinearConfig & config, const LinearWeights & weights) {
+    return weights.weight.type == GGML_TYPE_I8 && config.in_features % 32 == 0;
+}
+
 void validate_weight_shape(const LinearConfig & config, const LinearWeights & weights) {
+    const int64_t row = is_q8s_weight(config, weights)
+        ? GGML_PAD(config.in_features + config.in_features / 16, 16) : config.in_features;
     core::validate_shape(
         weights.weight,
-        core::TensorShape::from_dims({config.out_features, config.in_features}),
+        core::TensorShape::from_dims({config.out_features, row}),
         "weight");
 
     if (!config.use_bias) {
@@ -91,6 +99,24 @@ core::TensorValue LinearModule::build(
     const core::TensorShape matrix_input_shape = flatten_to_matrix_shape(contiguous_input.shape);
     core::TensorValue matrix_input = core::reshape_tensor(ctx, contiguous_input, matrix_input_shape);
 
+    if (is_q8s_weight(config_, weights)) {
+        if (config_.cuda_f16_output || config_.precision != GGML_PREC_DEFAULT ||
+                config_.cuda_nvfp4_f16_activation_lowering || config_.vulkan_f32_activation_lowering) {
+            throw std::runtime_error("Q8S linear weights support only the default F32 projection");
+        }
+        ggml_tensor * x = matrix_input.tensor;
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx.ggml, x, GGML_TYPE_F32);
+        } else if (!ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx.ggml, x);
+        }
+        ggml_tensor * projected_raw = ggml_mul_mat_q8s(ctx.ggml, weights.weight.tensor, x,
+            config_.use_bias ? weights.bias->tensor : nullptr, config_.round_bf16_output);
+        const core::TensorValue projected = core::wrap_tensor(projected_raw,
+            core::TensorShape::from_dims({matrix_input_shape.at(0), config_.out_features}), GGML_TYPE_F32);
+        return core::reshape_tensor(ctx, projected, input.shape.with_last_dim(config_.out_features));
+    }
+
     ggml_tensor * projected_raw = config_.cuda_f16_output
         ? ggml_mul_mat_f16(ctx.ggml, weights.weight.tensor, matrix_input.tensor)
         : ggml_mul_mat(ctx.ggml, weights.weight.tensor, matrix_input.tensor);
@@ -114,6 +140,9 @@ core::TensorValue LinearModule::build(
         projected = core::wrap_tensor(
             biased_raw, projected.shape,
             config_.cuda_f16_output ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    }
+    if (config_.round_bf16_output) {
+        projected = core::wrap_tensor(ggml_round_bf16(ctx.ggml, projected.tensor), projected.shape, GGML_TYPE_F32);
     }
 
     return core::reshape_tensor(ctx, projected, input.shape.with_last_dim(config_.out_features));
