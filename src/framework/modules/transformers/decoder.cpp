@@ -8,6 +8,7 @@
 #include "../module_internal.h"
 
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 
 namespace engine::modules {
@@ -289,6 +290,83 @@ core::TensorValue activation_cast(
     return core::wrap_tensor(ggml_cast(ctx.ggml, rounded.tensor, GGML_TYPE_F32), input.shape, GGML_TYPE_F32);
 }
 
+bool uses_fused_bf16_ops(const core::ModuleBuildContext & ctx, const DecoderActivationCastPolicy & policy) {
+    return policy.fused_bf16_ops && policy.enabled && policy.fused_round && policy.type == GGML_TYPE_BF16 &&
+        ctx.backend_type == core::BackendType::Cuda;
+}
+
+// RMS norm with the activation cast after it (cast_after). With the fused bf16 ops and the bf16 intermediate round
+// this is GGML_OP_RMS_NORM_BF16: r(r(rms_norm(x)) * w) in one kernel.
+core::TensorValue build_rounded_norm(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & input,
+    const NormWeights & weights,
+    const DecoderLayerConfig & config,
+    bool cast_after) {
+    const auto & cast = config.activation_cast;
+    if (uses_fused_bf16_ops(ctx, cast) && cast_after && cast.norm_intermediate_type == GGML_TYPE_BF16 &&
+            weights.weight.has_value() && weights.weight->tensor->type == GGML_TYPE_F32 && !weights.bias.has_value() &&
+            input.tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(input.tensor)) {
+        return core::wrap_tensor(ggml_rms_norm_bf16(ctx.ggml, input.tensor, weights.weight->tensor, config.rms_norm_eps),
+            input.shape, GGML_TYPE_F32);
+    }
+    auto x = RMSNormModule({config.hidden_size, config.rms_norm_eps, true, false, false, false,
+                           cast.norm_intermediate_type})
+                 .build(ctx, input, weights);
+    if (cast.enabled && cast_after) {
+        x = activation_cast(ctx, x, cast);
+    }
+    return x;
+}
+
+// RoPE on q and k [1, steps, heads, dim] with the activation cast after it, when the fused bf16 ops cover both: the
+// rounded NEOX RoPE is ggml_rope_halves_bf16, one kernel per tensor, and its rotated table is built once per graph
+// (found by name by the other layers). Returns false when the caller applies the unfused RoPE.
+bool apply_fused_rope(
+    core::ModuleBuildContext & ctx,
+    const DecoderLayerConfig & config,
+    const DecoderLayerWeights & weights,
+    const core::TensorValue & positions,
+    core::TensorValue & q,
+    core::TensorValue & k,
+    int64_t dim) {
+    const auto & cast = config.activation_cast;
+    const auto rows_of_heads = [&](const core::TensorValue & x) {
+        return x.tensor->type == GGML_TYPE_F32 && x.shape.rank == 4 && x.shape.dims[0] == 1 &&
+            x.tensor->nb[0] == sizeof(float) && x.tensor->nb[1] == dim * static_cast<int64_t>(sizeof(float));
+    };
+    if (!uses_fused_bf16_ops(ctx, cast) || !cast.after_rope || cast.rope_intermediate_type != GGML_TYPE_BF16 ||
+            config.rope_type != GGML_ROPE_TYPE_NEOX || positions.shape.rank != 1 ||
+            positions.shape.dims[0] != q.shape.dims[1] || !rows_of_heads(q) || !rows_of_heads(k)) {
+        return false;
+    }
+    const core::TensorValue * factors = weights.rope_frequency_factors.has_value()
+        ? &*weights.rope_frequency_factors
+        : nullptr;
+    const int64_t steps = q.shape.dims[1];
+    char name[GGML_MAX_NAME];
+    std::snprintf(name, sizeof(name), "rope_bf16.%p.%p", static_cast<void *>(positions.tensor),
+        factors != nullptr ? static_cast<void *>(factors->tensor) : nullptr);
+    ggml_tensor * table = ggml_get_tensor(ctx.ggml, name);
+    if (table == nullptr) {
+        RoPEConfig rope{dim, config.rope_type, config.rope_theta};
+        rope.intermediate_round_type = GGML_TYPE_BF16;
+        table = RoPEModule(rope).build_rounded_table(ctx, positions, factors, steps);
+        ggml_set_name(table, name);
+    }
+    auto * cos = ggml_view_2d(ctx.ggml, table, dim / 2, steps, table->nb[2], 0);
+    auto * sin = ggml_view_2d(ctx.ggml, table, dim / 2, steps, table->nb[2], dim / 2 * sizeof(float));
+    const auto rotate = [&](const core::TensorValue & x) {
+        const int64_t heads = x.shape.dims[2];
+        auto * rows = ggml_view_2d(ctx.ggml, x.tensor, heads * dim, steps, x.tensor->nb[2], 0);
+        auto * rotated = ggml_rope_halves_bf16(ctx.ggml, rows, cos, sin, static_cast<int>(heads), static_cast<int>(dim));
+        return core::wrap_tensor(ggml_reshape_4d(ctx.ggml, rotated, dim, heads, steps, 1), x.shape, GGML_TYPE_F32);
+    };
+    q = rotate(q);
+    k = rotate(k);
+    return true;
+}
+
 // The fused bf16 round after a projection whose Q8_0 weights are repacked for GGML_OP_MUL_MAT_Q8S is done by that
 // op (round_bf16_output): the same values without a separate kernel, and the caller skips the activation cast.
 // An output that is split into slices is only rounded by the op for a single row: the slices of several rows are
@@ -558,12 +636,7 @@ DecoderLayerOutputs DecoderLayerModule::build(
     const int64_t dim = require_head_dim(config_);
     const int64_t kv_repeats = config_.num_attention_heads / config_.num_key_value_heads;
 
-    auto x_norm = RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false, false, false,
-                                config_.activation_cast.norm_intermediate_type})
-                      .build(ctx, input, weights.input_norm);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_input_norm) {
-        x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
-    }
+    auto x_norm = build_rounded_norm(ctx, input, weights.input_norm, config_, config_.activation_cast.after_input_norm);
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
     if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !qkv.rounded) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
@@ -585,7 +658,8 @@ DecoderLayerOutputs DecoderLayerModule::build(
     }
     auto v = reshape_decoder_heads(ctx, qkv.v, config_.num_key_value_heads, dim);
 
-    if (config_.position_encoding == DecoderPositionEncoding::Rotary) {
+    if (config_.position_encoding == DecoderPositionEncoding::Rotary &&
+            !apply_fused_rope(ctx, config_, weights, positions, q, k, dim)) {
         const core::TensorValue * rope_factors = weights.rope_frequency_factors.has_value()
             ? &*weights.rope_frequency_factors
             : nullptr;
@@ -708,12 +782,7 @@ DecoderLayerOutputs DecoderLayerModule::build(
         x = activation_cast(ctx, x, config_.activation_cast);
     }
 
-    auto ff_in = RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false, false, false,
-                               config_.activation_cast.norm_intermediate_type})
-                     .build(ctx, x, weights.post_norm);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_ffn_norm) {
-        ff_in = activation_cast(ctx, ff_in, config_.activation_cast);
-    }
+    auto ff_in = build_rounded_norm(ctx, x, weights.post_norm, config_, config_.activation_cast.after_ffn_norm);
     auto ff = build_mlp(ctx, ff_in, config_, weights.mlp);
     auto output = AddModule{}.build(ctx, x, ff);
     if (config_.activation_cast.enabled && config_.activation_cast.after_output) {
@@ -769,12 +838,7 @@ DecoderLayerOutputs DecoderLayerModule::build_static_cache_impl(
     const int64_t dim = require_head_dim(config_);
     const int64_t kv_repeats = config_.num_attention_heads / config_.num_key_value_heads;
 
-    auto x_norm = RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false, false, false,
-                                config_.activation_cast.norm_intermediate_type})
-                      .build(ctx, input, weights.input_norm);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_input_norm) {
-        x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
-    }
+    auto x_norm = build_rounded_norm(ctx, input, weights.input_norm, config_, config_.activation_cast.after_input_norm);
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
     if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !qkv.rounded) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
@@ -796,7 +860,8 @@ DecoderLayerOutputs DecoderLayerModule::build_static_cache_impl(
     }
     auto v = reshape_decoder_heads(ctx, qkv.v, config_.num_key_value_heads, dim);
 
-    if (config_.position_encoding == DecoderPositionEncoding::Rotary) {
+    if (config_.position_encoding == DecoderPositionEncoding::Rotary &&
+            !apply_fused_rope(ctx, config_, weights, positions, q, k, dim)) {
         const core::TensorValue * rope_factors = weights.rope_frequency_factors.has_value()
             ? &*weights.rope_frequency_factors
             : nullptr;
@@ -916,12 +981,7 @@ DecoderLayerOutputs DecoderLayerModule::build_static_cache_impl(
         x = activation_cast(ctx, x, config_.activation_cast);
     }
 
-    auto ff_in = RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false, false, false,
-                               config_.activation_cast.norm_intermediate_type})
-                     .build(ctx, x, weights.post_norm);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_ffn_norm) {
-        ff_in = activation_cast(ctx, ff_in, config_.activation_cast);
-    }
+    auto ff_in = build_rounded_norm(ctx, x, weights.post_norm, config_, config_.activation_cast.after_ffn_norm);
     auto ff = build_mlp(ctx, ff_in, config_, weights.mlp);
     auto output = AddModule{}.build(ctx, x, ff);
     if (config_.activation_cast.enabled && config_.activation_cast.after_output) {
@@ -951,12 +1011,7 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
     const int64_t dim = require_head_dim(config_);
     const int64_t kv_repeats = config_.num_attention_heads / config_.num_key_value_heads;
 
-    auto x_norm = RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false, false, false,
-                                config_.activation_cast.norm_intermediate_type})
-                      .build(ctx, input, weights.input_norm);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_input_norm) {
-        x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
-    }
+    auto x_norm = build_rounded_norm(ctx, input, weights.input_norm, config_, config_.activation_cast.after_input_norm);
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
     if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !qkv.rounded) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
@@ -978,7 +1033,8 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
     }
     auto v = reshape_decoder_heads(ctx, qkv.v, config_.num_key_value_heads, dim);
 
-    if (config_.position_encoding == DecoderPositionEncoding::Rotary) {
+    if (config_.position_encoding == DecoderPositionEncoding::Rotary &&
+            !apply_fused_rope(ctx, config_, weights, positions, q, k, dim)) {
         apply_batched_static_rope(ctx, config_, weights, positions, q, k, dim);
         if (config_.activation_cast.enabled && config_.activation_cast.after_rope) {
             q = activation_cast(ctx, q, config_.activation_cast);
@@ -1081,12 +1137,7 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
         x = activation_cast(ctx, x, config_.activation_cast);
     }
 
-    auto ff_in = RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false, false, false,
-                               config_.activation_cast.norm_intermediate_type})
-                     .build(ctx, x, weights.post_norm);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_ffn_norm) {
-        ff_in = activation_cast(ctx, ff_in, config_.activation_cast);
-    }
+    auto ff_in = build_rounded_norm(ctx, x, weights.post_norm, config_, config_.activation_cast.after_ffn_norm);
     auto ff = build_mlp(ctx, ff_in, config_, weights.mlp);
     auto output = AddModule{}.build(ctx, x, ff);
     if (config_.activation_cast.enabled && config_.activation_cast.after_output) {

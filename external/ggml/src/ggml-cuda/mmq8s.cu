@@ -261,10 +261,12 @@ static __device__ __forceinline__ float rope_round_bf16(float x) {
     return __bfloat162float(__float2bfloat16(x));
 }
 
-// One thread per pair; the operation order matches the unfused graph (mul, round, sub/add, round).
+// One thread per pair; the operation order matches the unfused graph (mul, round, sub/add, round). The pairs are
+// interleaved (x[2i], x[2i+1]) or, with halves, the NEOX halves (x[i], x[i + half]) of each head.
+template <bool halves>
 static __global__ void rope_pairs_bf16(const float * __restrict__ x, const float * __restrict__ cos,
-        const float * __restrict__ sin, float * __restrict__ dst, const int64_t row_len, const int heads,
-        const int half, const int positions, const int64_t pairs) {
+        const float * __restrict__ sin, float * __restrict__ dst, const int64_t row_stride, const int heads,
+        const int half, const int positions, const int64_t table_stride, const int64_t pairs) {
     const int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= pairs) {
         return;
@@ -272,27 +274,41 @@ static __global__ void rope_pairs_bf16(const float * __restrict__ x, const float
     const int     pair = index % half;
     const int64_t head = index / half;  // over rows * heads
     const int64_t row  = head / heads;
-    const float * in   = x + row * row_len + (head % heads) * 2 * half + 2 * pair;
-    const int     slot = (row % positions) * half + pair;
-    const float a = in[0];
-    const float b = in[1];
+    const float * in   = x + row * row_stride + (head % heads) * 2 * half;
+    const int64_t slot = (row % positions) * table_stride + pair;
+    const float a = halves ? in[pair]        : in[2 * pair];
+    const float b = halves ? in[pair + half] : in[2 * pair + 1];
     const float c = cos[slot];
     const float s = sin[slot];
-    dst[2 * index]     = rope_round_bf16(rope_round_bf16(a * c) - rope_round_bf16(b * s));
-    dst[2 * index + 1] = rope_round_bf16(rope_round_bf16(b * c) + rope_round_bf16(a * s));
+    float * out = dst + head * 2 * half;
+    out[halves ? pair        : 2 * pair]     = rope_round_bf16(rope_round_bf16(a * c) - rope_round_bf16(b * s));
+    out[halves ? pair + half : 2 * pair + 1] = rope_round_bf16(rope_round_bf16(b * c) + rope_round_bf16(a * s));
 }
 
 void ggml_cuda_op_rope_pairs_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * x = dst->src[0];
-    const int heads    = ggml_get_op_params_i32(dst, 0);
-    const int head_dim = ggml_get_op_params_i32(dst, 1);
-    const int half     = head_dim / 2;
-    const int positions = (int) (ggml_nelements(dst->src[1]) / half);
-    const int64_t pairs = ggml_nrows(x) * heads * half;
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * cos = dst->src[1];
+    const int  heads    = ggml_get_op_params_i32(dst, 0);
+    const int  head_dim = ggml_get_op_params_i32(dst, 1);
+    const bool halves   = ggml_get_op_params_i32(dst, 2) != 0;
+    const int  half     = head_dim / 2;
+    // ggml_rope_pairs_bf16: contiguous x and tables; ggml_rope_halves_bf16: 2D x and tables with strided rows
+    const int64_t rows         = halves ? x->ne[1] : ggml_nrows(x);
+    const int64_t row_stride   = halves ? x->nb[1] / sizeof(float) : x->ne[0];
+    const int     positions    = halves ? (int) cos->ne[1] : (int) (ggml_nelements(cos) / half);
+    const int64_t table_stride = halves ? cos->nb[1] / sizeof(float) : half;
+    const int64_t pairs = rows * heads * half;
     const int block = 256;
-    rope_pairs_bf16<<<(pairs + block - 1) / block, block, 0, ctx.stream()>>>((const float *) x->data,
-        (const float *) dst->src[1]->data, (const float *) dst->src[2]->data, (float *) dst->data, x->ne[0], heads,
-        half, positions, pairs);
+    const dim3 grid((pairs + block - 1) / block);
+    if (halves) {
+        rope_pairs_bf16<true><<<grid, block, 0, ctx.stream()>>>((const float *) x->data, (const float *) cos->data,
+            (const float *) dst->src[2]->data, (float *) dst->data, row_stride, heads, half, positions, table_stride,
+            pairs);
+    } else {
+        rope_pairs_bf16<false><<<grid, block, 0, ctx.stream()>>>((const float *) x->data, (const float *) cos->data,
+            (const float *) dst->src[2]->data, (float *) dst->data, row_stride, heads, half, positions, table_stride,
+            pairs);
+    }
 }
 
 // One block per row: sum of squares, then r(r(x * rsqrt(mean + eps)) * w).

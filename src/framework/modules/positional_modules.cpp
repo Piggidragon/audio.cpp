@@ -78,16 +78,7 @@ core::TensorValue RoPEModule::build(
             throw std::runtime_error("Rounded RoPE requires full-dimension NEOX rotation");
         }
         const int64_t half = config_.dimensions / 2;
-        auto * basis = ggml_new_tensor_4d(ctx.ggml, GGML_TYPE_F32, half, 1, input.tensor->ne[2], 1);
-        auto * identity = ggml_concat(ctx.ggml, ggml_fill(ctx.ggml, basis, 1.0f),
-            ggml_fill(ctx.ggml, basis, 0.0f), 0);
-        auto * table = ggml_rope_ext(ctx.ggml, identity, positions.tensor,
-            frequency_factors ? frequency_factors->tensor : nullptr, config_.dimensions,
-            config_.mode, 0, config_.theta, config_.freq_scale, config_.ext_factor,
-            config_.attn_factor, config_.beta_fast, config_.beta_slow);
-        table = *config_.intermediate_round_type == GGML_TYPE_BF16
-            ? ggml_round_bf16(ctx.ggml, table)
-            : ggml_cast(ctx.ggml, ggml_cast(ctx.ggml, table, *config_.intermediate_round_type), GGML_TYPE_F32);
+        auto * table = build_rounded_table(ctx, positions, frequency_factors, input.tensor->ne[2]);
         auto * cos = ggml_view_4d(ctx.ggml, table, half, 1, table->ne[2], 1,
             table->nb[1], table->nb[2], table->nb[3], 0);
         auto * sin = ggml_view_4d(ctx.ggml, table, half, 1, table->ne[2], 1,
@@ -128,6 +119,26 @@ core::TensorValue RoPEModule::build(
             config_.beta_slow),
         input.shape,
         input.type);
+}
+
+ggml_tensor * RoPEModule::build_rounded_table(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & positions,
+    const core::TensorValue * frequency_factors,
+    int64_t steps) const {
+    if (!config_.intermediate_round_type.has_value() || config_.mode != GGML_ROPE_TYPE_NEOX) {
+        throw std::runtime_error("Rounded RoPE tables require NEOX rotation with an intermediate round type");
+    }
+    const int64_t half = config_.dimensions / 2;
+    auto * basis = ggml_new_tensor_4d(ctx.ggml, GGML_TYPE_F32, half, 1, steps, 1);
+    auto * identity = ggml_concat(ctx.ggml, ggml_fill(ctx.ggml, basis, 1.0f), ggml_fill(ctx.ggml, basis, 0.0f), 0);
+    auto * table = ggml_rope_ext(ctx.ggml, identity, positions.tensor,
+        frequency_factors ? frequency_factors->tensor : nullptr, config_.dimensions,
+        config_.mode, 0, config_.theta, config_.freq_scale, config_.ext_factor,
+        config_.attn_factor, config_.beta_fast, config_.beta_slow);
+    return *config_.intermediate_round_type == GGML_TYPE_BF16
+        ? ggml_round_bf16(ctx.ggml, table)
+        : ggml_cast(ctx.ggml, ggml_cast(ctx.ggml, table, *config_.intermediate_round_type), GGML_TYPE_F32);
 }
 
 core::TensorValue RoPEModule::build_batched(

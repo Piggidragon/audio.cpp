@@ -36,6 +36,14 @@ public:
         const core::TensorValue & positions,
         const core::TensorValue * frequency_factors = nullptr) const;
 
+    // The rotated identity of the rounded NEOX RoPE (intermediate_round_type): [dimensions, 1, steps] with the cos
+    // values in the first and the sin values in the second half of each row.
+    ggml_tensor * build_rounded_table(
+        core::ModuleBuildContext & ctx,
+        const core::TensorValue & positions,
+        const core::TensorValue * frequency_factors,
+        int64_t steps) const;
+
 private:
     RoPEConfig config_;
 };

@@ -1640,6 +1640,17 @@ extern "C" {
             int                   n_heads,
             int                   head_dim);
 
+    // As ggml_rope_pairs_bf16 for the NEOX pairs (x[i], x[i + head_dim/2]) of each head. x is 2D and may be a view
+    // with strided rows (e.g. the q or k part of a fused projection); cos and sin are [head_dim/2, positions] and may
+    // be views with strided rows (the halves of a rotated table).
+    GGML_API struct ggml_tensor * ggml_rope_halves_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * cos,
+            struct ggml_tensor  * sin,
+            int                   n_heads,
+            int                   head_dim);
+
     // r(r(rms_norm(x, eps)) * w) per row of x, r rounding to bf16; w has ne[0] values.
     GGML_API struct ggml_tensor * ggml_rms_norm_bf16(
             struct ggml_context * ctx,

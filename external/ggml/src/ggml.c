@@ -3660,7 +3660,32 @@ struct ggml_tensor * ggml_rope_pairs_bf16(
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, ggml_nrows(x));
 
-    const int32_t params[2] = { n_heads, head_dim };
+    const int32_t params[3] = { n_heads, head_dim, 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_ROPE_PAIRS_BF16;
+    result->src[0] = x;
+    result->src[1] = cos;
+    result->src[2] = sin;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_rope_halves_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * cos,
+        struct ggml_tensor  * sin,
+        int                   n_heads,
+        int                   head_dim) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(cos->type == GGML_TYPE_F32 && sin->type == GGML_TYPE_F32);
+    GGML_ASSERT(cos->nb[0] == sizeof(float) && sin->nb[0] == sizeof(float) && cos->nb[1] == sin->nb[1]);
+    GGML_ASSERT(cos->ne[0] == head_dim / 2 && ggml_are_same_shape(cos, sin) && cos->ne[2] == 1 && cos->ne[3] == 1);
+    GGML_ASSERT(head_dim % 2 == 0 && (int64_t) n_heads * head_dim <= x->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, x->ne[1]);
+
+    const int32_t params[3] = { n_heads, head_dim, 1 };
     ggml_set_op_params(result, params, sizeof(params));
     result->op     = GGML_OP_ROPE_PAIRS_BF16;
     result->src[0] = x;

@@ -73,6 +73,9 @@ struct DecoderActivationCastPolicy {
     // Qwen rounds normalized activations before applying the norm weight.
     std::optional<ggml_type> norm_intermediate_type = std::nullopt;
     std::optional<ggml_type> rope_intermediate_type = std::nullopt;
+    // CUDA: with fused_round, the bf16-rounded RMS norms and NEOX RoPE whose casts match them run as
+    // GGML_OP_RMS_NORM_BF16 and GGML_OP_ROPE_PAIRS_BF16 (the same roundings, one kernel instead of 4 and 17).
+    bool fused_bf16_ops = false;
 };
 
 struct DecoderAttentionPolicy {

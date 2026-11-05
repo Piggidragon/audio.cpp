@@ -53,6 +53,7 @@ struct MingGenerator::Impl {
         if (flash) c.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
         c.activation_cast.enabled = true;
         c.activation_cast.fused_round = true;  // one round_bf16 kernel instead of a cast round trip
+        c.activation_cast.fused_bf16_ops = true;  // fused rounded RMS norm and RoPE on CUDA
         c.activation_cast.norm_intermediate_type = GGML_TYPE_BF16;
         c.activation_cast.rope_intermediate_type = GGML_TYPE_BF16;
         c.activation_cast.after_input_norm = true;
