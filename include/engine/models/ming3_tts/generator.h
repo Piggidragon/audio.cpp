@@ -18,6 +18,7 @@ struct MingGenerationOptions {
     float cfg = 2.0f;
     float sigma = 0.25f;
     float temperature = 0.0f;
+    int64_t flow_steps = 10;
 };
 
 class MingGenerator {

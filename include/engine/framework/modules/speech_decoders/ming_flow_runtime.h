@@ -25,6 +25,12 @@ struct MingFlowConfig {
     std::string aggregator_prefix = "linear_proj_audio";
 };
 
+/** One generated latent patch and its aggregated LLM embedding, the input of the next decoder step. */
+struct MingFlowPatch {
+    std::vector<float> latent;
+    std::vector<float> embedding;
+};
+
 class MingFlowRuntime {
 public:
     MingFlowRuntime(std::shared_ptr<const assets::TensorSource> source,
@@ -38,6 +44,11 @@ public:
         const std::vector<float> & noise, const std::vector<float> & sde_noise,
         float cfg = 2.0f, float sigma = 0.25f, float temperature = 0.0f);
     std::vector<float> aggregate(const std::vector<float> & latent);
+    // sample() followed by aggregate() of its patch, run as one graph on the backend. Fewer than the official
+    // ten Euler steps trade fidelity for speed.
+    MingFlowPatch sample_and_aggregate(const std::vector<float> & conditioning, const std::vector<float> & history,
+        const std::vector<float> & noise, const std::vector<float> & sde_noise,
+        float cfg = 2.0f, float sigma = 0.25f, float temperature = 0.0f, int64_t steps = 10);
 
 private:
     struct Impl;

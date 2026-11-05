@@ -108,6 +108,7 @@ private:
         sampling.cfg = runtime::parse_finite_float_option(opts, {"guidance_scale"}).value_or(2.0f);
         sampling.sigma = runtime::parse_finite_float_option(opts, {"sigma"}).value_or(0.25f);
         sampling.temperature = runtime::parse_finite_float_option(opts, {"temperature"}).value_or(0.0f);
+        sampling.flow_steps = runtime::parse_positive_i64_option(opts, {"flow_steps"}, 10);
         if (sampling.sigma < 0 || sampling.temperature < 0) throw runtime::InvalidRequestError("Ming sigma and temperature must be nonnegative");
         uint64_t random_offset = 0;
         MingPromptOptions prompt_options;
@@ -200,6 +201,13 @@ private:
         const auto latent_dim = assets_->config.codec.encoder.latent_dim;
         runtime::StreamingAudioConfig stream_config;
         const auto & codec = assets_->config.codec;
+        // "cached" decodes every frame once with a per-layer key/value cache; "window" re-decodes a left
+        // context window per event.
+        const auto stream_decoder = runtime::find_option(opts, {"stream_decoder"}).value_or("cached");
+        if (stream_decoder != "cached" && stream_decoder != "window") {
+            throw runtime::InvalidRequestError("Ming stream_decoder must be cached or window");
+        }
+        const bool cached_decoder = streaming && stream_decoder == "cached";
         if (streaming) {
             stream_config.frames_per_chunk = static_cast<size_t>(runtime::parse_positive_i64_option(
                 opts, {"stream_frames_per_event"}, 4));
@@ -227,39 +235,60 @@ private:
             size_t last_speech_frame = 0;
             size_t published_samples = 0;
             const size_t trim_frame = static_cast<size_t>(sample_rate_ / 10);
-            if (streaming) {
+            const auto publish = [&](const std::vector<float> & samples) {
+                emitted_audio.insert(emitted_audio.end(), samples.begin(), samples.end());
+                while (checked_frames < emitted_audio.size() / trim_frame) {
+                    double score = 0;
+                    for (size_t i = checked_frames * trim_frame; i < (checked_frames + 1) * trim_frame; ++i) {
+                        score += std::abs(emitted_audio[i]);
+                    }
+                    if (score / trim_frame > 1e-3) last_speech_frame = checked_frames + 1;
+                    ++checked_frames;
+                }
+                const size_t ready = trim
+                    ? std::min(checked_frames * trim_frame, last_speech_frame * trim_frame + static_cast<size_t>(sample_rate_ * 3 / 10))
+                    : emitted_audio.size();
+                if (ready > published_samples) {
+                    if (stream_event_sink()) {
+                        runtime::StreamEvent output;
+                        output.audio_output = runtime::AudioBuffer{sample_rate_, 1,
+                            std::vector<float>(emitted_audio.begin() + published_samples, emitted_audio.begin() + ready)};
+                        stream_event_sink()(output);
+                    }
+                    published_samples = ready;
+                }
+            };
+            // Cached decoding: decode groups of final patches, growing like the window controller's events.
+            size_t target = stream_config.policy == runtime::StreamingAudioChunkPolicy::Grow ? 1 : stream_config.frames_per_chunk;
+            const auto decode_ready = [&](bool finishing) {
+                while (decoder_.stream_ready(finishing) >= (finishing ? 1 : target)) {
+                    publish(decoder_.stream_decode(std::min(target, decoder_.stream_ready(finishing)), finishing));
+                    target = std::min(stream_config.frames_per_chunk, target * 2);
+                }
+            };
+            if (cached_decoder) {
+                decoder_.stream_reset();
+            } else if (streaming) {
                 streaming_audio_.begin(stream_config, [&](const auto & window) {
                     return decoder_.decode_streaming_window(window, stream_config);
-                }, [&](const runtime::StreamEvent & event) {
-                    const auto & samples = event.audio_output->samples;
-                    emitted_audio.insert(emitted_audio.end(), samples.begin(), samples.end());
-                    while (checked_frames < emitted_audio.size() / trim_frame) {
-                        double score = 0;
-                        for (size_t i = checked_frames * trim_frame; i < (checked_frames + 1) * trim_frame; ++i) {
-                            score += std::abs(emitted_audio[i]);
-                        }
-                        if (score / trim_frame > 1e-3) last_speech_frame = checked_frames + 1;
-                        ++checked_frames;
-                    }
-                    const size_t ready = trim
-                        ? std::min(checked_frames * trim_frame, last_speech_frame * trim_frame + static_cast<size_t>(sample_rate_ * 3 / 10))
-                        : emitted_audio.size();
-                    if (ready > published_samples) {
-                        if (stream_event_sink()) {
-                            runtime::StreamEvent output;
-                            output.audio_output = runtime::AudioBuffer{sample_rate_, 1,
-                                std::vector<float>(emitted_audio.begin() + published_samples, emitted_audio.begin() + ready)};
-                            stream_event_sink()(output);
-                        }
-                        published_samples = ready;
-                    }
-                });
+                }, [&](const runtime::StreamEvent & event) { publish(event.audio_output->samples); });
             }
             const auto latent = generator_.generate(embeddings, sampling, random_offset, history,
                 streaming ? std::function<void(const std::vector<float> &)>([&](const auto & patch) {
-                    streaming_audio_.push(patch);
+                    if (cached_decoder) {
+                        decoder_.stream_push(patch);
+                        decode_ready(false);
+                    } else {
+                        streaming_audio_.push(patch);
+                    }
                 }) : std::function<void(const std::vector<float> &)>{});
-            auto audio = streaming ? streaming_audio_.finish().samples : decoder_.decode(latent);
+            std::vector<float> audio;
+            if (cached_decoder) {
+                decode_ready(true);
+                audio = emitted_audio;
+            } else {
+                audio = streaming ? streaming_audio_.finish().samples : decoder_.decode(latent);
+            }
             const size_t frame = static_cast<size_t>(sample_rate_ / 10);
             const size_t frames = audio.size() / frame;
             size_t last = frames;

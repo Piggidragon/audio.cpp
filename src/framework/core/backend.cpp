@@ -13,6 +13,10 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef AUDIOCPP_NVTX
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 namespace engine::core {
 
 void ensure_backends_loaded() {
@@ -718,9 +722,19 @@ ggml_status compute_backend_graph(
 #else
     (void)label;
 #endif
+#ifdef AUDIOCPP_NVTX
+    // Profiling builds: one NVTX range per graph, named by its label, for nsys timelines.
+    nvtxRangePushA(label != nullptr ? label : "graph");
+    const auto status = plan != nullptr
+        ? ggml_backend_graph_plan_compute(backend, plan)
+        : ggml_backend_graph_compute(backend, graph);
+    nvtxRangePop();
+    return status;
+#else
     return plan != nullptr
         ? ggml_backend_graph_plan_compute(backend, plan)
         : ggml_backend_graph_compute(backend, graph);
+#endif
 }
 
 void prepare_host_graph_plan(const ExecutionContext & execution_context, ggml_cgraph * graph, HostGraphPlan & plan) {

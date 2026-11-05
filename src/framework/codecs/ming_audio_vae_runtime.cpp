@@ -13,9 +13,11 @@
 #include <ggml-alloc.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <list>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 
@@ -42,6 +44,7 @@ void load_audio_backbone(core::BackendWeightStore & store, const assets::TensorS
     c.runtime.attention.prefill_mode = c.runtime.attention.allow_flash_attention
         ? modules::DecoderAttentionMode::FlashGroupedViewKV : modules::DecoderAttentionMode::ManualRepeat;
     c.activation_cast.enabled = true;
+    c.activation_cast.fused_round = true;  // one round_bf16 kernel instead of a cast round trip
     c.activation_cast.after_input_norm = true;
     c.activation_cast.after_qkv_projection = true;
     c.activation_cast.after_rope = true;
@@ -417,6 +420,208 @@ struct MingAudioDecoder::Impl {
         return runtime::AudioBuffer{sample_rate_, 1, std::vector<float>(audio.begin() + begin, audio.begin() + end)};
     }
 
+    ~Impl() {
+        incremental_graphs_.clear();
+        if (cache_buffer_) ggml_backend_buffer_free(cache_buffer_);
+        if (cache_context_) ggml_free(cache_context_);
+    }
+
+    // ---- Incremental streaming ----
+
+    struct CacheSet {
+        std::vector<core::TensorValue> keys, values;
+    };
+
+    struct IncrementalGraph : Graph {
+        using Graph::Graph;
+        int parity_ = 0;
+    };
+
+    // Two cache sets: a graph reads one and writes the next window into the other, so no op reads a
+    // cache that another op of the same graph overwrites.
+    void allocate_caches() {
+        const auto & c = decoder_config_.stack;
+        const int64_t context = sliding_window_ - 1;
+        const size_t tensors = static_cast<size_t>(4 * c.layers);
+        cache_context_ = ggml_init({ggml_tensor_overhead() * tensors, nullptr, true});
+        for (auto & set : caches_) {
+            for (int64_t layer = 0; layer < c.layers; ++layer) {
+                for (auto * list : {&set.keys, &set.values}) {
+                    auto * tensor = ggml_new_tensor_4d(cache_context_, GGML_TYPE_F32, c.head_dim, c.num_key_value_heads,
+                        context, 1);
+                    list->push_back(core::wrap_tensor(tensor,
+                        core::TensorShape::from_dims({1, context, c.num_key_value_heads, c.head_dim}), GGML_TYPE_F32));
+                }
+            }
+        }
+        cache_buffer_ = ggml_backend_alloc_ctx_tensors(cache_context_, execution_.backend());
+        if (!cache_buffer_) throw std::runtime_error("Ming audio decoder cache allocation failed");
+    }
+
+    IncrementalGraph & prepare_incremental(int64_t patches, int parity) {
+        const auto found = std::find_if(incremental_graphs_.begin(), incremental_graphs_.end(),
+            [&](const auto & entry) { return entry->patches_ == patches && entry->parity_ == parity; });
+        if (found != incremental_graphs_.end()) return **found;
+        if (incremental_graphs_.size() == 12) incremental_graphs_.pop_back();
+        auto graph = std::make_unique<IncrementalGraph>(execution_);
+        auto & g = *graph;
+        const auto & c = decoder_config_.stack;
+        const int64_t frames = patches * patch_;
+        const int64_t window = patches + 2;
+        const int64_t context = sliding_window_ - 1;
+        g.context_ = ggml_init({8 * 1024 * 1024, nullptr, true});
+        core::ModuleBuildContext ctx{g.context_, "ming3_tts.vae.decoder", execution_.backend_type()};
+        // The window holds one neighbouring patch on each side; the frames of the decoded patches interpolate
+        // exactly as in a full decode because the window keeps the interpolation scale.
+        g.input_ = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, window, latent_dim_}));
+        ggml_set_input(g.input_.tensor);
+        auto x = modules::LinearModule({latent_dim_, c.hidden_size, true}).build(ctx, g.input_, input_projection_);
+        x = modules::Bf16RoundModule{}.build(ctx, x);
+        x = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, x);
+        x = modules::Interpolate1dModule({window * patch_, modules::Interpolate1dMode::Linear}).build(ctx, x);
+        x = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, x);
+        x = core::wrap_tensor(ggml_cont(ctx.ggml, x.tensor), x.shape, x.type);
+        x = modules::SliceModule({1, patch_, frames}).build(ctx, x);
+        x = core::wrap_tensor(ggml_cont(ctx.ggml, x.tensor), x.shape, x.type);
+        g.positions_ = core::make_tensor(ctx, GGML_TYPE_I32, core::TensorShape::from_dims({frames}));
+        g.mask_ = core::make_tensor(ctx, GGML_TYPE_F16, core::TensorShape::from_dims({1, 1, frames, context + frames}));
+        ggml_set_input(g.positions_.tensor);
+        ggml_set_input(g.mask_.tensor);
+        modules::DecoderStackState prefix;
+        const auto & read = caches_[parity];
+        for (int64_t layer = 0; layer < c.layers; ++layer) prefix.layers.push_back({read.keys[layer], read.values[layer]});
+        // Flash attention over cache + new frames, as the full decode attends with flash attention too.
+        auto config = decoder_config_;
+        if (config.stack.runtime.attention.prefill_mode == modules::DecoderAttentionMode::FlashGroupedViewKV) {
+            config.stack.runtime.attention.prefix_mode = modules::DecoderPrefixAttentionMode::FlashWithPrefix;
+        }
+        auto decoded = modules::DecoderHiddenModule(config).build(ctx, x, g.positions_, weights_, prefix, g.mask_);
+        x = modules::LinearModule({c.hidden_size, fft_size_ + 2, false})
+            .build(ctx, decoded.hidden, {output_projection_.weight, std::nullopt});
+        x = modules::AddModule(false, true).build(ctx, modules::Bf16RoundModule{}.build(ctx, x), *output_projection_.bias);
+        g.output_ = modules::Bf16RoundModule{}.build(ctx, x);
+        ggml_set_output(g.output_.tensor);
+        g.graph_ = ggml_new_graph_custom(g.context_, 32768, false);
+        ggml_build_forward_expand(g.graph_, g.output_.tensor);
+        // The last `context` frames of cache + new frames become the next cache.
+        const auto & write = caches_[1 - parity];
+        for (int64_t layer = 0; layer < c.layers; ++layer) {
+            const auto & state = decoded.state.layers[layer];
+            const std::array<std::pair<const core::TensorValue *, const core::TensorValue *>, 2> pairs{{
+                {&*state.key, &write.keys[layer]}, {&*state.value, &write.values[layer]}}};
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                auto * fresh = pairs[i].first->tensor;
+                auto * cached = (i == 0 ? read.keys : read.values)[layer].tensor;
+                if (fresh->type != GGML_TYPE_F32) fresh = ggml_cast(ctx.ggml, fresh, GGML_TYPE_F32);
+                auto * all = ggml_concat(ctx.ggml, cached, fresh, 2);
+                auto * tail = ggml_view_4d(ctx.ggml, all, c.head_dim, c.num_key_value_heads, context, 1,
+                    all->nb[1], all->nb[2], all->nb[3], frames * all->nb[2]);
+                ggml_build_forward_expand(g.graph_, ggml_cpy(ctx.ggml, tail, pairs[i].second->tensor));
+            }
+        }
+        g.allocator_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(execution_.backend()));
+        if (!ggml_gallocr_reserve(g.allocator_, g.graph_) || !ggml_gallocr_alloc_graph(g.allocator_, g.graph_)) {
+            throw std::runtime_error("Ming audio decoder incremental graph allocation failed");
+        }
+        core::prepare_host_graph_plan(execution_, g.graph_, g.host_plan_);
+        g.patches_ = patches;
+        g.parity_ = parity;
+        incremental_graphs_.push_front(std::move(graph));
+        return *incremental_graphs_.front();
+    }
+
+    void stream_reset() {
+        if (!cache_buffer_) allocate_caches();
+        // Zero keys and values: masked scores must stay finite before the softmax mask applies.
+        ggml_backend_buffer_clear(cache_buffer_, 0);
+        parity_ = 0;
+        stream_pending_.clear();
+        stream_left_.clear();
+        stream_frames_ = 0;
+        stream_spectrum_.clear();
+        stream_spectrum_first_ = 0;
+        stream_samples_ = 0;
+    }
+
+    void stream_push(const std::vector<float> & patch) {
+        if (patch.size() != static_cast<size_t>(latent_dim_)) {
+            throw std::runtime_error("Ming audio decoder received an invalid streaming patch");
+        }
+        stream_pending_.insert(stream_pending_.end(), patch.begin(), patch.end());
+    }
+
+    size_t stream_ready(bool finishing) const {
+        const size_t pending = stream_pending_.size() / latent_dim_;
+        return finishing ? pending : (pending > 0 ? pending - 1 : 0);
+    }
+
+    std::vector<float> stream_decode(size_t patches, bool finishing) {
+        const size_t pending = stream_pending_.size() / latent_dim_;
+        if (patches == 0 || patches > stream_ready(finishing)) {
+            throw std::runtime_error("Ming audio decoder has fewer final patches than requested");
+        }
+        const auto patch_at = [&](size_t index) { return stream_pending_.begin() + index * latent_dim_; };
+        // The stream's first and last patches stand in for their missing neighbours, which reproduces the
+        // edge clamping of the interpolation.
+        std::vector<float> window = stream_left_.empty()
+            ? std::vector<float>(patch_at(0), patch_at(1)) : stream_left_;
+        window.insert(window.end(), patch_at(0), patch_at(patches));
+        const size_t right = patches < pending ? patches : patches - 1;
+        window.insert(window.end(), patch_at(right), patch_at(right + 1));
+        stream_left_.assign(patch_at(patches - 1), patch_at(patches));
+        stream_pending_.erase(stream_pending_.begin(), patch_at(patches));
+
+        const int64_t frames = static_cast<int64_t>(patches) * patch_;
+        const int64_t context = sliding_window_ - 1;
+        auto & g = prepare_incremental(static_cast<int64_t>(patches), parity_);
+        core::write_tensor_f32(g.input_, window);
+        std::vector<int32_t> positions(frames);
+        std::iota(positions.begin(), positions.end(), static_cast<int32_t>(stream_frames_));
+        ggml_backend_tensor_set(g.positions_.tensor, positions.data(), 0, positions.size() * sizeof(int32_t));
+        // Cache slot j holds frame stream_frames_ - context + j; a frame sees itself and the previous
+        // sliding_window - 1 frames.
+        const int64_t keys = context + frames;
+        std::vector<float> mask(frames * keys, -std::numeric_limits<float>::infinity());
+        for (int64_t row = 0; row < frames; ++row) {
+            const int64_t query = stream_frames_ + row;
+            for (int64_t col = 0; col < keys; ++col) {
+                const int64_t key = stream_frames_ - context + col;
+                if (key >= 0 && key <= query && key > query - sliding_window_) mask[row * keys + col] = 0.0f;
+            }
+        }
+        core::write_tensor_f16(g.mask_, mask);
+        if (core::compute_graph(execution_, g.graph_, g.host_plan_, "ming3_tts.vae.decoder") != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Ming audio decoder graph execution failed");
+        }
+        parity_ = 1 - parity_;
+        auto spectrum = core::read_tensor_f32(g.output_.tensor);
+        stream_spectrum_.insert(stream_spectrum_.end(), spectrum.begin(), spectrum.end());
+        stream_frames_ += frames;
+
+        // A sample is complete once every overlapping ISTFT frame is known: up to two frames before the end.
+        const bool tail = finishing && stream_pending_.empty();
+        const int64_t emit_end = tail ? stream_frames_ * hop_ : std::max<int64_t>(0, (stream_frames_ - 2) * hop_);
+        std::vector<float> audio;
+        if (emit_end > stream_samples_) {
+            const int64_t local_frames = stream_frames_ - stream_spectrum_first_;
+            auto & istft = stream_istft_[local_frames];
+            if (!istft) {
+                istft = std::make_unique<audio::HostLogMagnitudePhaseISTFT>(audio::HostLogMagnitudePhaseISTFTConfig{
+                    local_frames, fft_size_, hop_, fft_size_ + 2, static_cast<size_t>(execution_.config().threads)});
+            }
+            const auto local = istft->compute(stream_spectrum_, window_).audio;
+            const int64_t offset = stream_spectrum_first_ * hop_;
+            audio.assign(local.begin() + (stream_samples_ - offset), local.begin() + (emit_end - offset));
+            stream_samples_ = emit_end;
+        }
+        // Keep five spectral frames: the samples after the emitted ones overlap them.
+        const int64_t keep_first = std::max(stream_spectrum_first_, stream_frames_ - 5);
+        stream_spectrum_.erase(stream_spectrum_.begin(),
+            stream_spectrum_.begin() + (keep_first - stream_spectrum_first_) * (fft_size_ + 2));
+        stream_spectrum_first_ = keep_first;
+        return audio;
+    }
+
     core::ExecutionContext & execution_;
     core::BackendWeightStore store_;
     modules::DecoderHiddenConfig decoder_config_;
@@ -428,6 +633,14 @@ struct MingAudioDecoder::Impl {
     int sample_rate_ = 0;
     std::unique_ptr<Graph> offline_graph_;
     std::list<std::unique_ptr<Graph>> stream_graphs_;
+    std::list<std::unique_ptr<IncrementalGraph>> incremental_graphs_;
+    ggml_context * cache_context_ = nullptr;
+    ggml_backend_buffer_t cache_buffer_ = nullptr;
+    std::array<CacheSet, 2> caches_;
+    int parity_ = 0;
+    std::vector<float> stream_pending_, stream_left_, stream_spectrum_;
+    int64_t stream_frames_ = 0, stream_spectrum_first_ = 0, stream_samples_ = 0;
+    std::map<int64_t, std::unique_ptr<audio::HostLogMagnitudePhaseISTFT>> stream_istft_;
 };
 
 MingAudioEncoder::MingAudioEncoder(std::shared_ptr<const assets::TensorSource> source,
@@ -447,6 +660,12 @@ std::vector<float> MingAudioDecoder::decode(const std::vector<float> & latent) {
 runtime::AudioBuffer MingAudioDecoder::decode_streaming_window(const runtime::StreamingAudioWindow<float> & window,
     const runtime::StreamingAudioConfig & config) {
     return impl_->decode_streaming_window(window, config);
+}
+void MingAudioDecoder::stream_reset() { impl_->stream_reset(); }
+void MingAudioDecoder::stream_push(const std::vector<float> & patch) { impl_->stream_push(patch); }
+size_t MingAudioDecoder::stream_ready(bool finishing) const { return impl_->stream_ready(finishing); }
+std::vector<float> MingAudioDecoder::stream_decode(size_t patches, bool finishing) {
+    return impl_->stream_decode(patches, finishing);
 }
 
 }  // namespace engine::modules

@@ -72,6 +72,17 @@ public:
     runtime::AudioBuffer decode_streaming_window(const runtime::StreamingAudioWindow<float> & window,
         const runtime::StreamingAudioConfig & config);
 
+    // Incremental streaming: every frame passes the decoder stack once, with the keys and values of the
+    // previous sliding window cached per layer, instead of re-decoding a left context window per event.
+    // A patch is final once its successor is known (frames interpolate between neighbouring patches).
+    void stream_reset();
+    void stream_push(const std::vector<float> & patch);
+    // Patches that can be decoded now; all pushed patches once the stream is finishing.
+    size_t stream_ready(bool finishing) const;
+    // Decodes the next `patches` ready patches and returns the audio that is complete; with `finishing`
+    // and no patches left, the remaining tail is returned as well.
+    std::vector<float> stream_decode(size_t patches, bool finishing);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

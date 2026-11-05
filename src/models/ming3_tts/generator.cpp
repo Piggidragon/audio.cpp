@@ -52,6 +52,7 @@ struct MingGenerator::Impl {
         c.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
         if (flash) c.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
         c.activation_cast.enabled = true;
+        c.activation_cast.fused_round = true;  // one round_bf16 kernel instead of a cast round trip
         c.activation_cast.norm_intermediate_type = GGML_TYPE_BF16;
         c.activation_cast.rope_intermediate_type = GGML_TYPE_BF16;
         c.activation_cast.after_input_norm = true;
@@ -188,8 +189,12 @@ struct MingGenerator::Impl {
                 static_cast<size_t>(prompt.latent_position) + prompt_latents.size() / latent_dim_ != prompt.ids.size()) {
                 throw std::runtime_error("Ming prompt latent positions do not match the acoustic reference");
             }
-            const auto projected = flow_.aggregate(prompt_latents);
-            std::copy(projected.begin(), projected.end(), result.begin() + prompt.latent_position * hidden_);
+            // The acoustic reference is the same for every request with the same voice; aggregate it once.
+            if (prompt_latents != aggregated_latents_) {
+                aggregated_ = flow_.aggregate(prompt_latents);
+                aggregated_latents_ = prompt_latents;
+            }
+            std::copy(aggregated_.begin(), aggregated_.end(), result.begin() + prompt.latent_position * hidden_);
         }
         return result;
     }
@@ -214,17 +219,21 @@ struct MingGenerator::Impl {
             const auto noise = sampling::generate_torch_cuda_tensor_iterator_randn(latent_dim_, options.seed, offset,
                 policy, sampling::TorchRandnPrecision::BFloat16);
             offset += sampling::torch_cuda_tensor_iterator_offset_blocks(latent_dim_, policy);
-            const auto sde_noise = sampling::generate_torch_cuda_tensor_iterator_randn(10 * latent_dim_, options.seed, offset,
-                policy, sampling::TorchRandnPrecision::BFloat16);
+            // The SDE term is zero without temperature; its noise is skipped, but its offset still advances.
+            const bool sde = options.sigma != 0.0f && options.temperature != 0.0f;
+            const auto sde_noise = sde ? sampling::generate_torch_cuda_tensor_iterator_randn(10 * latent_dim_, options.seed,
+                offset, policy, sampling::TorchRandnPrecision::BFloat16) : std::vector<float>{};
             offset += sampling::torch_cuda_tensor_iterator_offset_blocks(10 * latent_dim_, policy);
-            auto patch = flow_.sample(state.hidden, history, noise, sde_noise, options.cfg, options.sigma, options.temperature);
+            auto sampled = flow_.sample_and_aggregate(state.hidden, history, noise, sde_noise,
+                options.cfg, options.sigma, options.temperature, options.flow_steps);
+            auto & patch = sampled.latent;
             latents.insert(latents.end(), patch.begin(), patch.end());
             if (on_patch) on_patch(patch);
             core::round_f32_to_bf16_in_place(state.logits);
             std::vector<float> stop_probability{1.0f / (1.0f + std::exp(state.logits.at(0) - state.logits.at(1)))};
             core::round_f32_to_bf16_in_place(stop_probability);
             if (step > 3 && stop_probability[0] > 0.5f) break;
-            if (step + 1 < budget) state = decoder_->decode_embedding(flow_.aggregate(patch));
+            if (step + 1 < budget) state = decoder_->decode_embedding(sampled.embedding);
             history = std::move(patch);
         }
         return latents;
@@ -233,6 +242,7 @@ struct MingGenerator::Impl {
     core::ExecutionContext & execution_;
     core::BackendWeightStore store_;
     modules::MingFlowRuntime flow_;
+    std::vector<float> aggregated_latents_, aggregated_;
     std::unique_ptr<modules::CausalDecoderRuntime> decoder_;
     int64_t hidden_ = 0, latent_dim_ = 0, vocabulary_ = 0, prompt_steps_ = 0;
     size_t prompt_speakers_ = 0;

@@ -271,6 +271,26 @@
           "fixed",
           "grow"
         ]
+      },
+      {
+        "name": "flow_steps",
+        "type": "int",
+        "description": "Euler steps of the flow sampler per patch; fewer than the official 10 trade fidelity for speed.",
+        "required": false,
+        "default": 10,
+        "min": 1,
+        "max": 32
+      },
+      {
+        "name": "stream_decoder",
+        "type": "enum",
+        "description": "Streaming audio decoder: cached decodes each frame once with a per-layer key/value cache; window re-decodes a left-context window per event.",
+        "required": false,
+        "default": "cached",
+        "values": [
+          "cached",
+          "window"
+        ]
       }
     ],
     "session": [
