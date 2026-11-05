@@ -1149,9 +1149,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_F16_HEAD40",
     "SSM_CONV_CAUSAL_SILU",
     "SSM_SCAN_MAMBA1",
+    "MUL_MAT_Q8S",
+    "ROPE_PAIRS_BF16",
 };
 
-static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
+static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1281,9 +1283,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_f16_head40(q, k, v)",
     "ssm_conv_causal_silu(x, w, bias)",
     "ssm_scan_mamba1(state, x, projected, A, ids, dt_w, dt_bias, D, gate)",
+    "mul_mat_q8s(w, x, bias)",
+    "rope_pairs_bf16(x, cos, sin)",
 };
 
-static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
+static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3608,6 +3612,57 @@ struct ggml_tensor * ggml_snake_1d(
     result->op     = GGML_OP_SNAKE_1D;
     result->src[0] = a;
     result->src[1] = alpha;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_q8s(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias,
+        bool                  round_bf16) {
+    GGML_ASSERT(w->type == GGML_TYPE_I8 && ggml_is_contiguous(w));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    const int64_t k = w->ne[0] * 16 / 17;
+    GGML_ASSERT(k % 32 == 0 && k + k / 16 == w->ne[0] && w->ne[0] % 16 == 0);
+    GGML_ASSERT(x->ne[0] == k);
+    GGML_ASSERT(bias == NULL || (bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == w->ne[1]));
+
+    const int64_t ne[4] = { w->ne[1], x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    const int32_t params[2] = { (int32_t) k, round_bf16 ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_MUL_MAT_Q8S;
+    result->src[0] = w;
+    result->src[1] = x;
+    result->src[2] = bias;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_rope_pairs_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * cos,
+        struct ggml_tensor  * sin,
+        int                   n_heads,
+        int                   head_dim) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(cos->type == GGML_TYPE_F32 && sin->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(cos) && ggml_is_contiguous(sin) && ggml_nelements(cos) == ggml_nelements(sin));
+    GGML_ASSERT(head_dim % 2 == 0 && (int64_t) n_heads * head_dim <= x->ne[0]);
+    GGML_ASSERT(ggml_nelements(cos) % (head_dim / 2) == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, ggml_nrows(x));
+
+    const int32_t params[2] = { n_heads, head_dim };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_ROPE_PAIRS_BF16;
+    result->src[0] = x;
+    result->src[1] = cos;
+    result->src[2] = sin;
 
     return result;
 }

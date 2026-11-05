@@ -2252,6 +2252,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_MUL_MAT_Q8S:
+        case GGML_OP_ROPE_PAIRS_BF16:
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2595,6 +2597,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+        case GGML_OP_MUL_MAT_Q8S:
+        case GGML_OP_ROPE_PAIRS_BF16:
             {
                 n_tasks = 1;
             } break;

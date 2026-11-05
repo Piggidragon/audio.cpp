@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmq8s.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -3198,6 +3199,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ROPE_INTERLEAVED_PAIRS:
             ggml_cuda_op_rope_interleaved_pairs(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_Q8S:
+            ggml_cuda_op_mul_mat_q8s(ctx, dst);
+            break;
+        case GGML_OP_ROPE_PAIRS_BF16:
+            ggml_cuda_op_rope_pairs_bf16(ctx, dst);
+            break;
         case GGML_OP_UPSCALE:
             ggml_cuda_op_upscale(ctx, dst);
             break;
@@ -6080,6 +6087,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ROPE_BACK: {
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
+        case GGML_OP_MUL_MAT_Q8S:
+            return op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_ROPE_PAIRS_BF16:
+            return true;
         case GGML_OP_ROPE_INTERLEAVED_PAIRS:
             return op->src[0]->type == op->type &&
                    op->src[1]->type == op->type &&

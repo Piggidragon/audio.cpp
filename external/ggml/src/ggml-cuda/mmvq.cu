@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvq-tune.h"
 
 #include <cstdint>
 
@@ -297,15 +298,16 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
+                return MMVQ_TUNE_NWARPS_1;
             case 2:
             case 3:
             case 4:
-                return 4;
+                return MMVQ_TUNE_NWARPS_2_4;
             case 5:
             case 6:
             case 7:
             case 8:
-                return 2;
+                return MMVQ_TUNE_NWARPS_5_8;
             default:
                 return 1;
         }
@@ -375,15 +377,16 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                return small_k ? nwarps : MMVQ_TUNE_RPB_1;
             case 2:
             case 3:
             case 4:
+                return MMVQ_TUNE_RPB_2_4;
             case 5:
             case 6:
             case 7:
             case 8:
-                return 2;
+                return MMVQ_TUNE_RPB_5_8;
             default:
                 return 1;
         }

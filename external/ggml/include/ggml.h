@@ -626,6 +626,11 @@ extern "C" {
         GGML_OP_SSM_CONV_CAUSAL_SILU,
         GGML_OP_SSM_SCAN_MAMBA1,
 
+        // small-batch int8 matrix-vector product with split scales (see ggml_mul_mat_q8s)
+        GGML_OP_MUL_MAT_Q8S,
+        // bf16-rounded rotation of interleaved pairs with a cos/sin table (see ggml_rope_pairs_bf16)
+        GGML_OP_ROPE_PAIRS_BF16,
+
         GGML_OP_COUNT,
     };
 
@@ -1610,6 +1615,27 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * alpha);
+
+    // dst = w x (+ bias), optionally rounded to bf16; meant for few columns of x (decode-sized batches).
+    // w is an I8 tensor [row_bytes, rows]: each row holds k int8 quants and then k/32 fp16 scales
+    // (Q8_0 with the scales split off), with row_bytes = k + k/16 a multiple of 16.
+    GGML_API struct ggml_tensor * ggml_mul_mat_q8s(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            bool                  round_bf16);
+
+    // Rotates the interleaved pairs (x[2i], x[2i+1]) of the first n_heads heads of every row of x, rounding each
+    // product and each result to bf16 as a bf16 model does: dst[2i] = r(r(a c) - r(b s)), dst[2i+1] = r(r(b c) + r(a s)).
+    // cos and sin hold head_dim/2 values per position; row j uses position j % positions. dst is [head_dim, n_heads, rows].
+    GGML_API struct ggml_tensor * ggml_rope_pairs_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * cos,
+            struct ggml_tensor  * sin,
+            int                   n_heads,
+            int                   head_dim);
 
     GGML_API struct ggml_tensor * ggml_mul_mat_pack4(
             struct ggml_context * ctx,

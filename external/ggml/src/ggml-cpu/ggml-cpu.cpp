@@ -457,6 +457,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ2_S   &&
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
+        case GGML_OP_MUL_MAT_Q8S:
+        case GGML_OP_ROPE_PAIRS_BF16:
+            return false;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_PACK4:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
