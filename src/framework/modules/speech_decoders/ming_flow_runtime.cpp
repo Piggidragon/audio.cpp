@@ -171,6 +171,19 @@ private:
             modules::LinearModule({linear.in, linear.out, true}).build(ctx, input, linear.weights));
     }
 
+    // RMS norm, rounded before and after the weight as the checkpoint's bf16 inference does; one fused op.
+    core::TensorValue rms_norm(core::ModuleBuildContext & ctx, const core::TensorValue & x,
+        const modules::NormWeights & weights) const {
+        const auto & weight = *weights.weight;
+        if (weight.type == GGML_TYPE_F32 && ggml_is_contiguous(x.tensor)) {
+            return core::wrap_tensor(ggml_rms_norm_bf16(ctx.ggml, x.tensor, weight.tensor, 1.0e-6f), x.shape,
+                GGML_TYPE_F32);
+        }
+        modules::NormConfig norm{hidden_, 1.0e-6f, true, false};
+        norm.normalized_round_type = GGML_TYPE_BF16;
+        return modules::Bf16RoundModule{}.build(ctx, modules::RMSNormModule(norm).build(ctx, x, weights));
+    }
+
     struct Block {
         modules::NormWeights norm1, norm2;
         Linear qkv, attn_out, ff_in, ff_out;
@@ -301,40 +314,28 @@ private:
     core::TensorValue build_blocks(core::ModuleBuildContext & ctx, core::TensorValue x, const RopeTable & rope,
         int64_t batch, int64_t steps) const {
         const int64_t dim = hidden_ / heads_;
-        modules::NormConfig norm{hidden_, 1.0e-6f, true, false};
-        norm.normalized_round_type = GGML_TYPE_BF16;
         for (const auto & block : blocks_) {
-            auto normalized = modules::RMSNormModule(norm).build(ctx, x, block.norm1);
-            normalized = modules::Bf16RoundModule{}.build(ctx, normalized);
+            auto normalized = rms_norm(ctx, x, block.norm1);
             auto * qkv = linear(ctx, block.qkv, normalized).tensor;
             const size_t row_bytes = qkv->nb[1];
             // The checkpoint rotates interleaved pairs (x[2i], x[2i+1]) with bf16 rounding after every product;
             // q and k are adjacent in each row, so one fused op covers both.
             auto * rotated = ggml_rope_pairs_bf16(ctx.ggml, qkv, rope.cos, rope.sin, static_cast<int>(2 * heads_),
                 static_cast<int>(dim));
+            // Attention among the tokens of each sequence, straight from the rotated q/k and the v of qkv.
             const auto heads_view = [&](ggml_tensor * source, size_t row, size_t offset) {
-                return core::wrap_tensor(ggml_view_4d(ctx.ggml, source, dim, heads_, steps, batch, dim * sizeof(float),
-                    row, row * steps, offset), core::TensorShape::from_dims({batch, steps, heads_, dim}), GGML_TYPE_F32);
+                return ggml_view_3d(ctx.ggml, source, dim, heads_, batch * steps, dim * sizeof(float), row, offset);
             };
             const size_t rotated_row = 2 * hidden_ * sizeof(float);
-            auto q = heads_view(rotated, rotated_row, 0);
-            auto k = heads_view(rotated, rotated_row, hidden_ * sizeof(float));
-            auto v = heads_view(qkv, row_bytes, 2 * hidden_ * sizeof(float));
-            q = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, q);
-            k = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, k);
-            v = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, v);
-            q = core::ensure_backend_addressable_layout(ctx, q);
-            k = core::ensure_backend_addressable_layout(ctx, k);
-            v = core::ensure_backend_addressable_layout(ctx, v);
-            auto attention = modules::ScaledDotProductAttentionModule({dim}).build(ctx, q, k, v);
-            attention = modules::Bf16RoundModule{}.build(ctx, attention);
-            attention = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, attention),
-                core::TensorShape::from_dims({batch, steps, hidden_}));
+            auto * attended = ggml_attn_rows_bf16(ctx.ggml, heads_view(rotated, rotated_row, 0),
+                heads_view(rotated, rotated_row, hidden_ * sizeof(float)),
+                heads_view(qkv, row_bytes, 2 * hidden_ * sizeof(float)), static_cast<int>(steps));
+            auto attention = core::wrap_tensor(ggml_reshape_3d(ctx.ggml, attended, hidden_, steps, batch),
+                core::TensorShape::from_dims({batch, steps, hidden_}), GGML_TYPE_F32);
             attention = linear(ctx, block.attn_out, attention);
             x = modules::AddModule{}.build(ctx, x, attention);
             x = modules::Bf16RoundModule{}.build(ctx, x);
-            normalized = modules::RMSNormModule(norm).build(ctx, x, block.norm2);
-            normalized = modules::Bf16RoundModule{}.build(ctx, normalized);
+            normalized = rms_norm(ctx, x, block.norm2);
             auto ff = linear(ctx, block.ff_in, normalized);
             ff = modules::GeluModule({modules::GeluApproximation::Tanh}).build(ctx, ff);
             ff = modules::Bf16RoundModule{}.build(ctx, ff);
@@ -342,8 +343,7 @@ private:
             x = modules::AddModule{}.build(ctx, x, ff);
             x = modules::Bf16RoundModule{}.build(ctx, x);
         }
-        x = modules::RMSNormModule(norm).build(ctx, x, final_norm_);
-        x = modules::Bf16RoundModule{}.build(ctx, x);
+        x = rms_norm(ctx, x, final_norm_);
         x = linear(ctx, output_projection_, x);
         auto output = modules::SliceModule({1, conditioned_ ? steps - 1 : 0, 1}).build(ctx, x);
         return core::wrap_tensor(ggml_cont(ctx.ggml, output.tensor), output.shape, output.type);

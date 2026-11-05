@@ -1151,9 +1151,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SSM_SCAN_MAMBA1",
     "MUL_MAT_Q8S",
     "ROPE_PAIRS_BF16",
+    "RMS_NORM_BF16",
+    "ATTN_ROWS_BF16",
 };
 
-static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
+static_assert(GGML_OP_COUNT == 121, "GGML_OP_COUNT != 121");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1285,9 +1287,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ssm_scan_mamba1(state, x, projected, A, ids, dt_w, dt_bias, D, gate)",
     "mul_mat_q8s(w, x, bias)",
     "rope_pairs_bf16(x, cos, sin)",
+    "rms_norm_bf16(x, w)",
+    "attn_rows_bf16(q, k, v)",
 };
 
-static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
+static_assert(GGML_OP_COUNT == 121, "GGML_OP_COUNT != 121");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3663,6 +3667,47 @@ struct ggml_tensor * ggml_rope_pairs_bf16(
     result->src[0] = x;
     result->src[1] = cos;
     result->src[2] = sin;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_rms_norm_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == x->ne[0]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+    result->op     = GGML_OP_RMS_NORM_BF16;
+    result->src[0] = x;
+    result->src[1] = w;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_attn_rows_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        int                   group) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_shape(q, v) && q->ne[3] == 1);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+    GGML_ASSERT(group > 0 && group <= 32 && q->ne[2] % group == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q->ne[0] * q->ne[1], q->ne[2]);
+
+    const int32_t params[1] = { group };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_ATTN_ROWS_BF16;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
 
     return result;
 }

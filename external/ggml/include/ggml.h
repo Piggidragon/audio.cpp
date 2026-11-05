@@ -630,6 +630,9 @@ extern "C" {
         GGML_OP_MUL_MAT_Q8S,
         // bf16-rounded rotation of interleaved pairs with a cos/sin table (see ggml_rope_pairs_bf16)
         GGML_OP_ROPE_PAIRS_BF16,
+        // bf16-rounded RMS norm with weight, and attention over short row groups (see below)
+        GGML_OP_RMS_NORM_BF16,
+        GGML_OP_ATTN_ROWS_BF16,
 
         GGML_OP_COUNT,
     };
@@ -1636,6 +1639,22 @@ extern "C" {
             struct ggml_tensor  * sin,
             int                   n_heads,
             int                   head_dim);
+
+    // r(r(rms_norm(x, eps)) * w) per row of x, r rounding to bf16; w has ne[0] values.
+    GGML_API struct ggml_tensor * ggml_rms_norm_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            float                 eps);
+
+    // Non-causal softmax attention within groups of `group` consecutive rows, scaled by 1/sqrt(head_dim) and
+    // rounded to bf16. q, k, v are [head_dim, heads, rows] (views allowed); dst is [head_dim * heads, rows].
+    GGML_API struct ggml_tensor * ggml_attn_rows_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            int                   group);
 
     GGML_API struct ggml_tensor * ggml_mul_mat_pack4(
             struct ggml_context * ctx,

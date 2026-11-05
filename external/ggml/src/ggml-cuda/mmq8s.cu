@@ -177,3 +177,95 @@ void ggml_cuda_op_rope_pairs_bf16(ggml_backend_cuda_context & ctx, ggml_tensor *
         (const float *) dst->src[1]->data, (const float *) dst->src[2]->data, (float *) dst->data, x->ne[0], heads,
         half, positions, pairs);
 }
+
+// One block per row: sum of squares, then r(r(x * rsqrt(mean + eps)) * w).
+static __global__ void rms_norm_bf16(const float * __restrict__ x, const float * __restrict__ w,
+        float * __restrict__ dst, const int cols, const float eps) {
+    const float * in  = x + (int64_t) blockIdx.x * cols;
+    float       * out = dst + (int64_t) blockIdx.x * cols;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        sum += in[i] * in[i];
+    }
+    __shared__ float partial[32];
+    sum = warp_reduce_sum<32>(sum);
+    if (threadIdx.x % 32 == 0) {
+        partial[threadIdx.x / 32] = sum;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sum = threadIdx.x < blockDim.x / 32 ? partial[threadIdx.x] : 0.0f;
+        sum = warp_reduce_sum<32>(sum);
+        if (threadIdx.x == 0) {
+            partial[0] = sum;
+        }
+    }
+    __syncthreads();
+    const float scale = rsqrtf(partial[0] / cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        out[i] = rope_round_bf16(rope_round_bf16(scale * in[i]) * w[i]);
+    }
+}
+
+void ggml_cuda_op_rms_norm_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    rms_norm_bf16<<<ggml_nrows(x), 256, 0, ctx.stream()>>>((const float *) x->data,
+        (const float *) dst->src[1]->data, (float *) dst->data, (int) x->ne[0], eps);
+}
+
+// One warp per (row, head): the query attends to the rows of its group; lanes split the head dimension.
+static __global__ void attn_rows_bf16(const char * __restrict__ q, const char * __restrict__ k,
+        const char * __restrict__ v, float * __restrict__ dst, const int head_dim, const int heads, const int rows,
+        const int group, const int64_t q1, const int64_t q2, const int64_t k1, const int64_t k2,
+        const int64_t v1, const int64_t v2) {
+    const int task = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (task >= rows * heads) {
+        return;
+    }
+    const int lane  = threadIdx.x % 32;
+    const int head  = task % heads;
+    const int row   = task / heads;
+    const int first = row - row % group;
+    const float * query = (const float *) (q + row * q2 + head * q1);
+    const float scale = rsqrtf((float) head_dim);
+    float scores[32];
+    float top = -INFINITY;
+    for (int j = 0; j < group; ++j) {
+        const float * key = (const float *) (k + (first + j) * k2 + head * k1);
+        float dot = 0.0f;
+        for (int d = lane; d < head_dim; d += 32) {
+            dot += query[d] * key[d];
+        }
+        scores[j] = warp_reduce_sum<32>(dot) * scale;
+        top = fmaxf(top, scores[j]);
+    }
+    float total = 0.0f;
+    for (int j = 0; j < group; ++j) {
+        scores[j] = expf(scores[j] - top);
+        total += scores[j];
+    }
+    for (int d = lane; d < head_dim; d += 32) {
+        float value = 0.0f;
+        for (int j = 0; j < group; ++j) {
+            value += scores[j] / total * ((const float *) (v + (first + j) * v2 + head * v1))[d];
+        }
+        dst[(int64_t) row * heads * head_dim + head * head_dim + d] = rope_round_bf16(value);
+    }
+}
+
+void ggml_cuda_op_attn_rows_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const int head_dim = (int) q->ne[0];
+    const int heads    = (int) q->ne[1];
+    const int rows     = (int) q->ne[2];
+    const int group    = ggml_get_op_params_i32(dst, 0);
+    const int warps    = 4;
+    const int tasks    = rows * heads;
+    attn_rows_bf16<<<(tasks + warps - 1) / warps, 32 * warps, 0, ctx.stream()>>>((const char *) q->data,
+        (const char *) k->data, (const char *) v->data, (float *) dst->data, head_dim, heads, rows, group,
+        q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2]);
+}
